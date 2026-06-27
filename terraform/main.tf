@@ -52,6 +52,17 @@ variable "desired_count" {
 }
 
 # ---------------------------------------------------------------------------
+# Locals – pre-computed, length-capped names for AWS resources that enforce
+# a 32-character limit (ALB name and Target Group name).
+# ---------------------------------------------------------------------------
+locals {
+  # ALB name must be <= 32 characters
+  alb_name = substr("${var.project_name}-alb", 0, 32)
+  # Target Group name must be <= 32 characters
+  tg_name  = substr("${var.project_name}-tg", 0, 32)
+}
+
+# ---------------------------------------------------------------------------
 # Data Sources
 # ---------------------------------------------------------------------------
 data "aws_caller_identity" "current" {}
@@ -209,7 +220,7 @@ resource "aws_security_group_rule" "ecs_inbound_from_alb" {
 # ALB
 # ---------------------------------------------------------------------------
 resource "aws_lb" "main" {
-  name               = "${var.project_name}-alb"
+  name               = local.alb_name
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
@@ -221,7 +232,7 @@ resource "aws_lb" "main" {
 }
 
 resource "aws_lb_target_group" "app" {
-  name        = "${var.project_name}-tg"
+  name        = local.tg_name
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id

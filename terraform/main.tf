@@ -11,19 +11,9 @@ terraform {
   backend "s3" {}
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Variables
-###############################################################################
-
-variable "image_uri" {
-  description = "Full ECR image URI including tag (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:abc1234)"
-  type        = string
-}
-
-variable "project_name" {
-  description = "Project name used for resource naming"
-  type        = string
-}
+# ---------------------------------------------------------------------------
 
 variable "aws_region" {
   description = "AWS region"
@@ -31,8 +21,18 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "project_name" {
+  description = "Project name used as a prefix for all resources"
+  type        = string
+}
+
+variable "container_image" {
+  description = "Full ECR image URI including tag (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:abc1234)"
+  type        = string
+}
+
 variable "desired_count" {
-  description = "ECS service desired task count"
+  description = "Desired number of ECS tasks"
   type        = number
   default     = 1
 }
@@ -40,41 +40,41 @@ variable "desired_count" {
 variable "task_cpu" {
   description = "ECS task CPU units"
   type        = number
-  default     = 256
+  default     = 512
 }
 
 variable "task_memory" {
   description = "ECS task memory in MiB"
   type        = number
-  default     = 512
+  default     = 1024
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Provider
-###############################################################################
+# ---------------------------------------------------------------------------
 
 provider "aws" {
   region = var.aws_region
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Data sources
-###############################################################################
-
-data "aws_caller_identity" "current" {}
+# ---------------------------------------------------------------------------
 
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-###############################################################################
-# Networking - VPC, subnets, IGW, route table
-###############################################################################
+data "aws_caller_identity" "current" {}
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
   enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = {
     Name    = "${var.project_name}-vpc"
@@ -94,7 +94,7 @@ resource "aws_internet_gateway" "main" {
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.${count.index}.0/24"
+  cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
 
@@ -113,7 +113,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name    = "${var.project_name}-rt-public"
+    Name    = "${var.project_name}-public-rt"
     Project = var.project_name
   }
 }
@@ -124,18 +124,17 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Security Groups
-###############################################################################
+# ---------------------------------------------------------------------------
 
-# ALB security group - allow inbound HTTP (80) from anywhere
+# ALB security group - allows inbound HTTP (80) from anywhere
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-alb-sg"
-  description = "ALB: allow HTTP from internet"
+  description = "Allow inbound HTTP from the internet"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "HTTP from internet"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -143,7 +142,6 @@ resource "aws_security_group" "alb" {
   }
 
   egress {
-    description = "All outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -156,16 +154,13 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# ECS task security group - allow inbound 8000 from ALB SG only
-# Defined WITHOUT inline cross-references to avoid dependency cycles;
-# the ALB -> ECS ingress rule is expressed as a standalone resource below.
+# ECS task security group - no inline cross-references to avoid cycle
 resource "aws_security_group" "ecs_tasks" {
   name        = "${var.project_name}-ecs-tasks-sg"
-  description = "ECS tasks: allow inbound 8000 from ALB SG"
+  description = "Allow inbound TCP 8000 from ALB only"
   vpc_id      = aws_vpc.main.id
 
   egress {
-    description = "All outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -178,8 +173,7 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
-# Standalone ingress rule: ALB SG -> ECS tasks port 8000
-# Using a separate resource avoids the SG <-> SG dependency cycle.
+# Standalone rule: ECS tasks ingress on 8000 from ALB SG (breaks potential cycle)
 resource "aws_security_group_rule" "ecs_tasks_ingress_from_alb" {
   type                     = "ingress"
   from_port                = 8000
@@ -187,12 +181,12 @@ resource "aws_security_group_rule" "ecs_tasks_ingress_from_alb" {
   protocol                 = "tcp"
   security_group_id        = aws_security_group.ecs_tasks.id
   source_security_group_id = aws_security_group.alb.id
-  description              = "Allow inbound 8000 from ALB security group"
+  description              = "Allow inbound 8000 from ALB"
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # ECR Repository
-###############################################################################
+# ---------------------------------------------------------------------------
 
 resource "aws_ecr_repository" "app" {
   name                 = var.project_name
@@ -229,11 +223,24 @@ resource "aws_ecr_lifecycle_policy" "app" {
   })
 }
 
-###############################################################################
-# IAM - ECS task execution role
-###############################################################################
+# ---------------------------------------------------------------------------
+# CloudWatch Log Group
+# ---------------------------------------------------------------------------
 
-data "aws_iam_policy_document" "ecs_task_assume_role" {
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/${var.project_name}"
+  retention_in_days = 7
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# ---------------------------------------------------------------------------
+# IAM - ECS Task Execution Role
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ecs_task_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
@@ -244,8 +251,8 @@ data "aws_iam_policy_document" "ecs_task_assume_role" {
 }
 
 resource "aws_iam_role" "ecs_task_execution" {
-  name               = "${var.project_name}-ecs-task-execution"
-  assume_role_policy = data.aws_iam_policy_document.ecs_task_assume_role.json
+  name               = "${var.project_name}-ecs-exec-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
 
   tags = {
     Project = var.project_name
@@ -257,22 +264,9 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-###############################################################################
-# CloudWatch Log Group
-###############################################################################
-
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/ecs/${var.project_name}"
-  retention_in_days = 7
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-###############################################################################
+# ---------------------------------------------------------------------------
 # ECS Cluster
-###############################################################################
+# ---------------------------------------------------------------------------
 
 resource "aws_ecs_cluster" "main" {
   name = "${var.project_name}-cluster"
@@ -287,22 +281,34 @@ resource "aws_ecs_cluster" "main" {
   }
 }
 
-###############################################################################
+resource "aws_ecs_cluster_capacity_providers" "main" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 1
+  }
+}
+
+# ---------------------------------------------------------------------------
 # ECS Task Definition
-###############################################################################
+# ---------------------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "app" {
   family                   = "${var.project_name}-task"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = var.task_cpu
-  memory                   = var.task_memory
+  cpu                      = tostring(var.task_cpu)
+  memory                   = tostring(var.task_memory)
   execution_role_arn       = aws_iam_role.ecs_task_execution.arn
 
   container_definitions = jsonencode([
     {
-      name  = var.project_name
-      image = var.image_uri
+      name      = var.project_name
+      image     = var.container_image
+      essential = true
 
       portMappings = [
         {
@@ -314,25 +320,31 @@ resource "aws_ecs_task_definition" "app" {
 
       environment = [
         {
-          name  = "PORT"
-          value = "8000"
-        },
-        {
           name  = "APP_ENV"
           value = "production"
+        },
+        {
+          name  = "PORT"
+          value = "8000"
         }
       ]
 
       logConfiguration = {
         logDriver = "awslogs"
         options = {
-          awslogs-group         = aws_cloudwatch_log_group.app.name
-          awslogs-region        = var.aws_region
-          awslogs-stream-prefix = "ecs"
+          "awslogs-group"         = aws_cloudwatch_log_group.app.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "ecs"
         }
       }
 
-      essential = true
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
     }
   ])
 
@@ -341,9 +353,9 @@ resource "aws_ecs_task_definition" "app" {
   }
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Application Load Balancer
-###############################################################################
+# ---------------------------------------------------------------------------
 
 resource "aws_lb" "main" {
   name               = "${var.project_name}-alb"
@@ -355,7 +367,6 @@ resource "aws_lb" "main" {
   enable_deletion_protection = false
 
   tags = {
-    Name    = "${var.project_name}-alb"
     Project = var.project_name
   }
 }
@@ -371,15 +382,15 @@ resource "aws_lb_target_group" "app" {
     enabled             = true
     healthy_threshold   = 2
     unhealthy_threshold = 3
+    timeout             = 5
     interval            = 30
-    timeout             = 10
     path                = "/health"
-    protocol            = "HTTP"
     matcher             = "200-299"
+    protocol            = "HTTP"
+    port                = "traffic-port"
   }
 
   tags = {
-    Name    = "${var.project_name}-tg"
     Project = var.project_name
   }
 }
@@ -393,11 +404,15 @@ resource "aws_lb_listener" "http" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app.arn
   }
+
+  tags = {
+    Project = var.project_name
+  }
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # ECS Service
-###############################################################################
+# ---------------------------------------------------------------------------
 
 resource "aws_ecs_service" "app" {
   name            = "${var.project_name}-service"
@@ -406,7 +421,7 @@ resource "aws_ecs_service" "app" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
-  # Force new deployment so the latest task definition revision is used
+  # Force a new deployment when image changes
   force_new_deployment = true
 
   network_configuration {
@@ -429,30 +444,24 @@ resource "aws_ecs_service" "app" {
   tags = {
     Project = var.project_name
   }
-
-  lifecycle {
-    ignore_changes = [
-      # Allow external deployments without Terraform drift
-    ]
-  }
 }
 
-###############################################################################
+# ---------------------------------------------------------------------------
 # Outputs
-###############################################################################
+# ---------------------------------------------------------------------------
 
 output "ecr_repository_url" {
-  description = "ECR repository URL"
+  description = "ECR repository URL (without tag)"
   value       = aws_ecr_repository.app.repository_url
 }
 
 output "alb_dns_name" {
-  description = "ALB DNS name - public endpoint for the application"
+  description = "ALB DNS name - public endpoint of the application"
   value       = aws_lb.main.dns_name
 }
 
-output "app_url" {
-  description = "Application URL"
+output "alb_url" {
+  description = "Full HTTP URL of the application"
   value       = "http://${aws_lb.main.dns_name}"
 }
 

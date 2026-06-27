@@ -1,18 +1,18 @@
-name: Deploy to ECS Fargate
+name: Build and Deploy
 
 on:
   workflow_dispatch:
 
 jobs:
-  ##############################################################################
-  # BUILD - build Docker image, push to ECR
-  ##############################################################################
+  # ---------------------------------------------------------------------------
+  # BUILD: build Docker image, push to ECR
+  # ---------------------------------------------------------------------------
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
 
     outputs:
-      image_uri: ${{ steps.build-push.outputs.image_uri }}
+      image_uri: ${{ steps.image_uri.outputs.image_uri }}
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
@@ -26,50 +26,44 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Log in to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Pre-create the ECR repository if it does not yet exist so that
+      # `docker push` succeeds before Terraform has run for the first time.
+      # Terraform will import (adopt) this repo on the first apply.
       - name: Ensure ECR repository exists
-        id: ensure-ecr
         run: |
           aws ecr describe-repositories \
             --repository-names "${{ secrets.PROJECT_NAME }}" \
-            --region "${{ secrets.AWS_REGION }}" \
+            --region "${{ secrets.AWS_REGION }}" 2>/dev/null \
           || aws ecr create-repository \
                --repository-name "${{ secrets.PROJECT_NAME }}" \
                --region "${{ secrets.AWS_REGION }}"
 
-      - name: Build, tag, and push Docker image
-        id: build-push
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.PROJECT_NAME }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Set image URI output
+        id: image_uri
         run: |
-          # Create a minimal requirements.txt if one does not exist
-          if [ ! -f requirements.txt ]; then
-            echo "fastapi>=0.110.0" > requirements.txt
-            echo "uvicorn[standard]>=0.29.0" >> requirements.txt
-            echo "gunicorn>=21.2.0" >> requirements.txt
-            echo "aiofiles>=23.2.1" >> requirements.txt
-          fi
-
-          # Ensure public/ directory exists so COPY public/ in Dockerfile doesn't fail
-          mkdir -p public
-
-          docker build -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" .
-          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-
-          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_URI="${REGISTRY}/${{ secrets.PROJECT_NAME }}:${{ github.sha }}"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "Built and pushed: ${IMAGE_URI}"
 
-  ##############################################################################
-  # DEPLOY - Terraform apply, update ECS service
-  ##############################################################################
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "${{ steps.image_uri.outputs.image_uri }}" \
+            .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push "${{ steps.image_uri.outputs.image_uri }}"
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY: Terraform init -> import ECR repo -> apply -> wait -> smoke test
+  # ---------------------------------------------------------------------------
   deploy:
-    name: Deploy Infrastructure & Service
+    name: Terraform Deploy
     runs-on: ubuntu-latest
     needs: build
 
@@ -84,7 +78,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Set up Terraform
+      - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.5"
@@ -98,99 +92,70 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Import ECR repository into Terraform state (adopt if already exists)
+      # Import the ECR repository that the build job may have pre-created so
+      # Terraform adopts it instead of trying (and failing) to create it again.
+      - name: Import ECR repository (adopt if already exists)
         working-directory: terraform
-        env:
-          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          # If the ECR repo was pre-created by the build job, import it so
-          # Terraform adopts rather than tries to recreate it.
           terraform import \
-            -var="image_uri=${{ needs.build.outputs.image_uri }}" \
-            -var="project_name=${PROJECT_NAME}" \
-            -var="aws_region=${AWS_REGION}" \
-            aws_ecr_repository.app "${PROJECT_NAME}" || true
-
-      - name: Terraform Plan
-        working-directory: terraform
-        env:
-          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-        run: |
-          terraform plan \
-            -var="image_uri=${{ needs.build.outputs.image_uri }}" \
-            -var="project_name=${PROJECT_NAME}" \
-            -var="aws_region=${AWS_REGION}" \
-            -out=tfplan
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="container_image=${{ needs.build.outputs.image_uri }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            aws_ecr_repository.app "${{ secrets.PROJECT_NAME }}" || true
 
       - name: Terraform Apply
         working-directory: terraform
-        env:
-          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          terraform apply -auto-approve tfplan
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="container_image=${{ needs.build.outputs.image_uri }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
 
-      - name: Get ALB DNS name
-        id: get-alb
+      - name: Capture Terraform outputs
+        id: tf_outputs
         working-directory: terraform
-        env:
-          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           ALB_DNS=$(terraform output -raw alb_dns_name)
+          ECS_CLUSTER=$(terraform output -raw ecs_cluster_name)
+          ECS_SERVICE=$(terraform output -raw ecs_service_name)
           echo "alb_dns=${ALB_DNS}" >> "$GITHUB_OUTPUT"
-          echo "ALB DNS: ${ALB_DNS}"
+          echo "ecs_cluster=${ECS_CLUSTER}" >> "$GITHUB_OUTPUT"
+          echo "ecs_service=${ECS_SERVICE}" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for ECS service to stabilise
-        env:
-          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+      - name: Wait for ECS service to reach steady state
         run: |
-          CLUSTER="${PROJECT_NAME}-cluster"
-          SERVICE="${PROJECT_NAME}-service"
-          echo "Waiting for ECS service ${SERVICE} in cluster ${CLUSTER} to reach steady state..."
+          echo "Waiting for ECS service '${{ steps.tf_outputs.outputs.ecs_service }}' in cluster '${{ steps.tf_outputs.outputs.ecs_cluster }}' to reach steady state..."
           aws ecs wait services-stable \
-            --cluster "${CLUSTER}" \
-            --services "${SERVICE}" \
-            --region "${AWS_REGION}"
+            --cluster "${{ steps.tf_outputs.outputs.ecs_cluster }}" \
+            --services "${{ steps.tf_outputs.outputs.ecs_service }}" \
+            --region "${{ secrets.AWS_REGION }}"
           echo "ECS service is stable."
 
-      - name: Self-verify - health check
-        env:
-          ALB_DNS: ${{ steps.get-alb.outputs.alb_dns }}
+      - name: Smoke test - hit /health endpoint
         run: |-
-          echo "Hitting health endpoint: http://${ALB_DNS}/health"
+          ALB_URL="http://${{ steps.tf_outputs.outputs.alb_dns }}/health"
+          echo "Smoke testing: ${ALB_URL}"
 
-          # Retry for up to 3 minutes to allow tasks to pass health checks
-          MAX_RETRIES=18
+          # Retry for up to 3 minutes (18 attempts x 10 s) to allow the ALB
+          # health checks to pass and traffic to flow.
+          MAX_ATTEMPTS=18
           SLEEP_SECS=10
-          SUCCESS=0
+          attempt=1
 
-          for i in $(seq 1 $MAX_RETRIES); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 15 \
-              "http://${ALB_DNS}/health" || echo "000")
+          while [ $attempt -le $MAX_ATTEMPTS ]; do
+            echo "Attempt ${attempt}/${MAX_ATTEMPTS} - GET ${ALB_URL}"
+            HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+              --max-time 10 "${ALB_URL}" || echo "000")
 
-            echo "Attempt ${i}/${MAX_RETRIES}: HTTP ${HTTP_CODE}"
-
-            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
-              echo "Health check passed with HTTP ${HTTP_CODE}."
-              SUCCESS=1
-              break
+            if echo "$HTTP_STATUS" | grep -qE '^(2|3)[0-9]{2}$'; then
+              echo "SUCCESS - received HTTP ${HTTP_STATUS}"
+              exit 0
             fi
 
-            if [ "${i}" -lt "${MAX_RETRIES}" ]; then
-              echo "Non-2xx response (${HTTP_CODE}), retrying in ${SLEEP_SECS}s..."
-              sleep "${SLEEP_SECS}"
-            fi
+            echo "Received HTTP ${HTTP_STATUS}, retrying in ${SLEEP_SECS}s..."
+            sleep $SLEEP_SECS
+            attempt=$((attempt + 1))
           done
 
-          if [ "${SUCCESS}" -ne 1 ]; then
-            echo "ERROR: Health check failed after ${MAX_RETRIES} attempts. Last HTTP code: ${HTTP_CODE}"
-            exit 1
-          fi
-
-          echo "Deployment verified successfully."
-          echo "App URL: http://${ALB_DNS}"
+          echo "FAILED - /health did not return a 2xx/3xx after ${MAX_ATTEMPTS} attempts."
+          exit 1

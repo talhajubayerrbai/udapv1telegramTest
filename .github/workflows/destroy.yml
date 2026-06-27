@@ -31,6 +31,7 @@ jobs:
       - name: Terraform Destroy
         working-directory: terraform
         run: |
-          terraform destroy -auto-approve \
+          terraform destroy \
+            -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}"

@@ -6,12 +6,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
+# Copy full repo context
 COPY app/ ./app/
-COPY main.py .
-
-# Copy optional static files if they exist
 COPY public/ ./public/
+COPY main.py .
 
 EXPOSE 8000
 

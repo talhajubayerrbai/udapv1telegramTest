@@ -11,70 +11,79 @@ terraform {
   backend "s3" {}
 }
 
-# ---------------------------------------------------------------------------
-# Variables
-# ---------------------------------------------------------------------------
-
-variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
-}
-
-variable "project_name" {
-  description = "Project name used as a prefix for all resources"
-  type        = string
-}
-
-variable "container_image" {
-  description = "Full ECR image URI including tag (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/myapp:abc1234)"
-  type        = string
-}
-
-variable "desired_count" {
-  description = "Desired number of ECS tasks"
-  type        = number
-  default     = 1
-}
-
-variable "task_cpu" {
-  description = "ECS task CPU units"
-  type        = number
-  default     = 512
-}
-
-variable "task_memory" {
-  description = "ECS task memory in MiB"
-  type        = number
-  default     = 1024
-}
-
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
-
 provider "aws" {
   region = var.aws_region
 }
 
 # ---------------------------------------------------------------------------
-# Data sources
+# Variables
 # ---------------------------------------------------------------------------
+variable "aws_region" {
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "project_name" {
+  type        = string
+}
+
+variable "image_tag" {
+  type        = string
+}
+
+variable "container_port" {
+  type        = number
+  default     = 8000
+}
+
+variable "task_cpu" {
+  type        = number
+  default     = 256
+}
+
+variable "task_memory" {
+  type        = number
+  default     = 512
+}
+
+variable "desired_count" {
+  type        = number
+  default     = 1
+}
+
+# ---------------------------------------------------------------------------
+# Data Sources
+# ---------------------------------------------------------------------------
+data "aws_caller_identity" "current" {}
 
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-data "aws_caller_identity" "current" {}
+# ---------------------------------------------------------------------------
+# ECR Repository
+# ---------------------------------------------------------------------------
+resource "aws_ecr_repository" "app" {
+  name                 = var.project_name
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+
+  image_scanning_configuration {
+    scan_on_push = false
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}
 
 # ---------------------------------------------------------------------------
-# Networking
+# VPC & Networking
 # ---------------------------------------------------------------------------
-
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
     Name    = "${var.project_name}-vpc"
@@ -91,15 +100,26 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-resource "aws_subnet" "public" {
-  count                   = 2
+resource "aws_subnet" "public_a" {
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
 
   tags = {
-    Name    = "${var.project_name}-public-${count.index}"
+    Name    = "${var.project_name}-public-a"
+    Project = var.project_name
+  }
+}
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name    = "${var.project_name}-public-b"
     Project = var.project_name
   }
 }
@@ -118,20 +138,22 @@ resource "aws_route_table" "public" {
   }
 }
 
-resource "aws_route_table_association" "public" {
-  count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
   route_table_id = aws_route_table.public.id
 }
 
 # ---------------------------------------------------------------------------
 # Security Groups
 # ---------------------------------------------------------------------------
-
-# ALB security group - allows inbound HTTP (80) from anywhere
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-alb-sg"
-  description = "Allow inbound HTTP from the internet"
+  description = "Allow inbound HTTP from the internet to the ALB"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -154,10 +176,9 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# ECS task security group - no inline cross-references to avoid cycle
 resource "aws_security_group" "ecs_tasks" {
-  name        = "${var.project_name}-ecs-tasks-sg"
-  description = "Allow inbound TCP 8000 from ALB only"
+  name        = "${var.project_name}-ecs-sg"
+  description = "Allow inbound on container port from the ALB only"
   vpc_id      = aws_vpc.main.id
 
   egress {
@@ -168,68 +189,76 @@ resource "aws_security_group" "ecs_tasks" {
   }
 
   tags = {
-    Name    = "${var.project_name}-ecs-tasks-sg"
+    Name    = "${var.project_name}-ecs-sg"
     Project = var.project_name
   }
 }
 
-# Standalone rule: ECS tasks ingress on 8000 from ALB SG (breaks potential cycle)
-resource "aws_security_group_rule" "ecs_tasks_ingress_from_alb" {
+# Standalone rule to avoid SG dependency cycle
+resource "aws_security_group_rule" "ecs_inbound_from_alb" {
   type                     = "ingress"
-  from_port                = 8000
-  to_port                  = 8000
+  from_port                = var.container_port
+  to_port                  = var.container_port
   protocol                 = "tcp"
   security_group_id        = aws_security_group.ecs_tasks.id
   source_security_group_id = aws_security_group.alb.id
-  description              = "Allow inbound 8000 from ALB"
+  description              = "Allow inbound TCP 8000 from ALB SG"
 }
 
 # ---------------------------------------------------------------------------
-# ECR Repository
+# ALB
 # ---------------------------------------------------------------------------
-
-resource "aws_ecr_repository" "app" {
-  name                 = var.project_name
-  image_tag_mutability = "MUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
+resource "aws_lb" "main" {
+  name               = "${var.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
 
   tags = {
-    Name    = var.project_name
     Project = var.project_name
   }
 }
 
-resource "aws_ecr_lifecycle_policy" "app" {
-  repository = aws_ecr_repository.app.name
+resource "aws_lb_target_group" "app" {
+  name        = "${var.project_name}-tg"
+  port        = var.container_port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
 
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 10 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 10
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+  health_check {
+    path                = "/health"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+    interval            = 30
+    matcher             = "200-399"
+  }
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
 }
 
 # ---------------------------------------------------------------------------
-# CloudWatch Log Group
+# ECS Cluster
 # ---------------------------------------------------------------------------
-
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/ecs/${var.project_name}"
-  retention_in_days = 7
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project_name}-cluster"
 
   tags = {
     Project = var.project_name
@@ -239,7 +268,6 @@ resource "aws_cloudwatch_log_group" "app" {
 # ---------------------------------------------------------------------------
 # IAM - ECS Task Execution Role
 # ---------------------------------------------------------------------------
-
 data "aws_iam_policy_document" "ecs_task_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -265,67 +293,39 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_policy" {
 }
 
 # ---------------------------------------------------------------------------
-# ECS Cluster
+# CloudWatch Log Group
 # ---------------------------------------------------------------------------
-
-resource "aws_ecs_cluster" "main" {
-  name = "${var.project_name}-cluster"
-
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/${var.project_name}"
+  retention_in_days = 7
 
   tags = {
     Project = var.project_name
   }
 }
 
-resource "aws_ecs_cluster_capacity_providers" "main" {
-  cluster_name       = aws_ecs_cluster.main.name
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE"
-    weight            = 1
-    base              = 1
-  }
-}
-
 # ---------------------------------------------------------------------------
 # ECS Task Definition
 # ---------------------------------------------------------------------------
-
 resource "aws_ecs_task_definition" "app" {
-  family                   = "${var.project_name}-task"
+  family                   = var.project_name
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = tostring(var.task_cpu)
-  memory                   = tostring(var.task_memory)
+  cpu                      = var.task_cpu
+  memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.ecs_task_execution.arn
 
   container_definitions = jsonencode([
     {
       name      = var.project_name
-      image     = var.container_image
+      image     = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.project_name}:${var.image_tag}"
       essential = true
 
       portMappings = [
         {
-          containerPort = 8000
-          hostPort      = 8000
+          containerPort = var.container_port
+          hostPort      = var.container_port
           protocol      = "tcp"
-        }
-      ]
-
-      environment = [
-        {
-          name  = "APP_ENV"
-          value = "production"
-        },
-        {
-          name  = "PORT"
-          value = "8000"
         }
       ]
 
@@ -338,13 +338,16 @@ resource "aws_ecs_task_definition" "app" {
         }
       }
 
-      healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
-      }
+      environment = [
+        {
+          name  = "PORT"
+          value = tostring(var.container_port)
+        },
+        {
+          name  = "APP_ENV"
+          value = "production"
+        }
+      ]
     }
   ])
 
@@ -354,66 +357,8 @@ resource "aws_ecs_task_definition" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# Application Load Balancer
-# ---------------------------------------------------------------------------
-
-resource "aws_lb" "main" {
-  name               = "${var.project_name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
-
-  enable_deletion_protection = false
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_lb_target_group" "app" {
-  name        = "${var.project_name}-tg"
-  port        = 8000
-  protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
-  target_type = "ip"
-
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    timeout             = 5
-    interval            = 30
-    path                = "/health"
-    matcher             = "200-299"
-    protocol            = "HTTP"
-    port                = "traffic-port"
-  }
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-# ---------------------------------------------------------------------------
 # ECS Service
 # ---------------------------------------------------------------------------
-
 resource "aws_ecs_service" "app" {
   name            = "${var.project_name}-service"
   cluster         = aws_ecs_cluster.main.id
@@ -421,11 +366,8 @@ resource "aws_ecs_service" "app" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
-  # Force a new deployment when image changes
-  force_new_deployment = true
-
   network_configuration {
-    subnets          = aws_subnet.public[*].id
+    subnets          = [aws_subnet.public_a.id, aws_subnet.public_b.id]
     security_groups  = [aws_security_group.ecs_tasks.id]
     assign_public_ip = true
   }
@@ -433,7 +375,7 @@ resource "aws_ecs_service" "app" {
   load_balancer {
     target_group_arn = aws_lb_target_group.app.arn
     container_name   = var.project_name
-    container_port   = 8000
+    container_port   = var.container_port
   }
 
   depends_on = [
@@ -449,20 +391,14 @@ resource "aws_ecs_service" "app" {
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
-
-output "ecr_repository_url" {
-  description = "ECR repository URL (without tag)"
-  value       = aws_ecr_repository.app.repository_url
-}
-
 output "alb_dns_name" {
-  description = "ALB DNS name - public endpoint of the application"
+  description = "Public DNS name of the Application Load Balancer"
   value       = aws_lb.main.dns_name
 }
 
-output "alb_url" {
-  description = "Full HTTP URL of the application"
-  value       = "http://${aws_lb.main.dns_name}"
+output "ecr_repository_url" {
+  description = "ECR repository URL"
+  value       = aws_ecr_repository.app.repository_url
 }
 
 output "ecs_cluster_name" {

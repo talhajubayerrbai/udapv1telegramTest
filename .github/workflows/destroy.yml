@@ -5,9 +5,7 @@ on:
 
 jobs:
   destroy:
-    name: Terraform Destroy
     runs-on: ubuntu-latest
-
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -15,10 +13,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v2
 
       - name: Terraform Init
         working-directory: terraform
@@ -31,7 +29,6 @@ jobs:
       - name: Terraform Destroy
         working-directory: terraform
         run: |
-          terraform destroy \
-            -auto-approve \
+          terraform destroy -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}"

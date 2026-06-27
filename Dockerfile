@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -6,10 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy full repo context
-COPY app/ ./app/
-COPY public/ ./public/
-COPY main.py .
+# Copy application source
+COPY . .
 
 EXPOSE 8000
 

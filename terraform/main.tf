@@ -57,6 +57,16 @@ variable "desired_count" {
 }
 
 # ---------------------------------------------------------------------------
+# Local values
+# ---------------------------------------------------------------------------
+
+locals {
+  # AWS ALB and Target Group names are limited to 32 characters.
+  # Truncate project_name to 28 chars so "-alb" / "-tg" suffixes fit safely.
+  alb_name_prefix = substr(var.project_name, 0, 28)
+}
+
+# ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
 
@@ -384,8 +394,9 @@ resource "aws_ecs_task_definition" "app" {
 # Application Load Balancer
 # ---------------------------------------------------------------------------
 
+# ALB name is limited to 32 characters by AWS. Use the truncated prefix.
 resource "aws_lb" "main" {
-  name               = "${var.project_name}-alb"
+  name               = "${local.alb_name_prefix}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
@@ -399,8 +410,9 @@ resource "aws_lb" "main" {
   }
 }
 
+# Target group name is also limited to 32 characters by AWS. Use the truncated prefix.
 resource "aws_lb_target_group" "app" {
-  name        = "${var.project_name}-tg"
+  name        = "${local.alb_name_prefix}-tg"
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
